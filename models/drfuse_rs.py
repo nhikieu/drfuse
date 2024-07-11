@@ -34,8 +34,9 @@ class JSD(nn.Module):
         return 0.5 * (self.kl(m, p.log()) + self.kl(m, q.log())).sum() / (1e-6)
 
 class DrFuse_RS_Trainer(nn.Module):
-    def __init__(self, config, ckpt=None):
+    def __init__(self, config, pretrain=False, ckpt=None):
         super().__init__()
+        self.pretrain = pretrain
         self.model = DrFuse_RS_Model()
         self.alignment_cos_sim = nn.CosineSimilarity(dim=1)
         self.jsd = JSD()
@@ -80,16 +81,16 @@ class DrFuse_RS_Trainer(nn.Module):
         wandb.watch(self.model, log="all", log_freq=100)
         self.model.to(device)
 
-        for epoch in tqdm(range(100)):
+        for epoch in tqdm(range(150)):
             for _, (images, labels, masks) in enumerate(train_loader):
-                batch = (images.to(device), labels.to(device), masks.to(device))
+                batch = (images.to(device), labels.to(device), torch.tensor(masks).to(device))
 
                 if self.example_count % 512 == 0 or (_+1) == len(train_loader):
                     log = True
                 else:
                     log = False
 
-                train_loss = self.training_step(batch, log)
+                train_loss = self.training_step(batch, log, self.pretrain)
                 self.example_count += len(images)
 
                 if self.example_count % 128 == 0 or (_+1) == len(train_loader):
@@ -102,20 +103,23 @@ class DrFuse_RS_Trainer(nn.Module):
                     running_val_loss = 0
                     with torch.no_grad():
                         for _, (images, labels, masks) in enumerate(val_loader):
-                            batch = (images.to(device), labels.to(device), masks.to(device))
-                            val_loss = self.validation_step(batch)
+                            batch = (images.to(device), labels.to(device), torch.tensor(masks).to(device))
+                            val_loss = self.validation_step(batch, self.pretrain)
                             running_val_loss += val_loss
+
+                            if (_+1) == len(val_loader):
+                                val_img, val_seg_full, val_seg_miss = self._log_val_seg(batch, self.pretrain)
+
                     val_loss = running_val_loss / len(val_loader)
 
-                    val_img, val_seg_full, val_seg_miss = self._log_val_seg((images, labels, masks))
                     self._wanb_log(train_loss, val_loss, self.example_count, epoch, val_img, val_seg_full, val_seg_miss)
 
                     # Save loss_dict to file
-                    with open('saveModelPath/loss_dict.json', 'w') as f:
+                    with open(os.path.join(self.saveModelPath,'loss_dict.json'), 'w') as f:
                         json.dump(self.loss_dict, f)
 
                     if val_loss <= self.best_loss:
-                        best_loss = val_loss
+                        self.best_loss = val_loss
 
                         # if there are more than 5 saved checkpoints
                         dir = os.listdir(self.saveModelPath)
@@ -126,7 +130,7 @@ class DrFuse_RS_Trainer(nn.Module):
                             os.remove(oldest_file)
                         
                         # Save best model
-                        f_name = '_'.join([str(int(time.time())), f'loss{best_loss:.4f}'])
+                        f_name = '_'.join([str(int(time.time())), f'loss{self.best_loss:.4f}'])
                         best_model_path = os.path.join(self.saveModelPath, f_name)
                         torch.save(
                             {
@@ -135,20 +139,20 @@ class DrFuse_RS_Trainer(nn.Module):
                             best_model_path
                         )
 
-    def training_step(self, batch, log):
+    def training_step(self, batch, log, pretrain):
         (x, y, masks) = batch
         out = self.model(x, masks)
 
-        train_loss = self._compute_and_log_loss(out, y_gt=y, log=log)
+        train_loss = self._compute_and_log_loss(out, y_gt=y, log=log, pretrain=pretrain)
 
         train_loss.backward()
         
         return train_loss.item()
     
-    def validation_step(self, batch):
+    def validation_step(self, batch, pretrain):
         (x, y, masks) = batch
         out = self.model(x, masks)
-        val_loss = self._compute_and_log_loss(out, y_gt=y, log=True, mode='val')
+        val_loss = self._compute_and_log_loss(out, y_gt=y, log=True, mode='val', pretrain=pretrain)
 
         return val_loss.item()
     
@@ -165,17 +169,27 @@ class DrFuse_RS_Trainer(nn.Module):
         print(f"Train loss after {str(step).zfill(5)} examples: {train_loss:.3f}")
         print(f"Val loss after {str(step).zfill(5)} examples: {val_loss:.3f}")
 
-    def _log_val_seg(self, batch):
+    def _log_val_seg(self, batch, pretrain):
         (x, y, masks) = batch
+        x = x.to('cpu')
+        self.model.to('cpu')
+
         img = x[0].unsqueeze(0)
         rgb_img = x[0].unsqueeze(0)[:, 0:3, :, :]
         img_array = rgb_img.permute((0, 2, 3, 1)).numpy().squeeze()
 
-        with torch.no_grad():
-            mask = [1]
-            output_full = self.model(img, mask)['pred_multimodal'][0]
-            mask = [0]
-            output_miss = self.model(img, mask)['pred_multimodal'][0]
+        if pretrain:
+            with torch.no_grad():
+                mask = torch.tensor([1])
+                output = self.model(img, mask)
+                output_full = output['pred_rgb'][0]
+                output_miss = output['pred_ndsm'][0]
+        else:
+            with torch.no_grad():
+                mask = torch.tensor([1])
+                output_full = self.model(img, mask)['pred_multimodal'][0]
+                mask = torch.tensor([0])
+                output_miss = self.model(img, mask)['pred_multimodal'][0]
 
         output_full = output_full.argmax(dim=0)
         output_miss = output_miss.argmax(dim=0)
@@ -187,10 +201,12 @@ class DrFuse_RS_Trainer(nn.Module):
         seg_array_full = wandb.Image(seg_array_full, caption="seg_full")
         seg_array_miss = wandb.Image(seg_array_miss, caption="seg_miss")
 
+        self.model.to('cuda')
+
         return img_array, seg_array_full, seg_array_miss
 
 
-    def _convert_prediction(image):
+    def _convert_prediction(self, image):
         # TODO make clase 6 - bg same color with class 0
         valGT = [[255,255,255], [0,0,255], [0,255,255], [0,255,0], [255,255,0], [255,255,255]]
 
@@ -203,15 +219,11 @@ class DrFuse_RS_Trainer(nn.Module):
             
         return output.astype('uint8')
     
-    def _compute_prediction_losses(self, model_output, y_gt, log=True, mode='train'):
+    def _compute_prediction_losses(self, model_output, y_gt, pretrain, log=True, mode='train'):
         num_cls = 6
         y_gt = torch.squeeze(y_gt, dim=1)
         y_gt = expand_target(y_gt)
         y_gt = y_gt.type(torch.LongTensor).to('cuda' if torch.cuda.is_available() else 'mps')
-
-        loss_pred_final = softmax_weighted_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
-        loss_pred_final_ = dice_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
-        loss_pred_final = loss_pred_final + loss_pred_final_
 
         # TODO implement missing modality at training
         loss_pred_rgb = softmax_weighted_loss(model_output['pred_rgb'], y_gt, num_cls=num_cls)
@@ -222,20 +234,27 @@ class DrFuse_RS_Trainer(nn.Module):
         loss_pred_ndsm_ = dice_loss(model_output['pred_ndsm'], y_gt, num_cls=num_cls)
         loss_pred_ndsm = loss_pred_ndsm + loss_pred_ndsm_
 
-        loss_pred_shared = softmax_weighted_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
-        loss_pred_shared_ = dice_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
-        loss_pred_shared = loss_pred_shared + loss_pred_shared_
+        if not pretrain:
+            loss_pred_final = softmax_weighted_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
+            loss_pred_final_ = dice_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
+            loss_pred_final = loss_pred_final + loss_pred_final_
 
-        scale_cross_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
-        scale_dice_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
-        for scale_pred in model_output['aux_preds']:
-            scale_pred = scale_pred.to('cuda' if torch.cuda.is_available() else 'mps')
-            y_gt = y_gt.to('cuda' if torch.cuda.is_available() else 'mps')
-            scale_cross_loss += softmax_weighted_loss(scale_pred, y_gt, num_cls=num_cls)
-            scale_dice_loss += dice_loss(scale_pred, y_gt, num_cls=num_cls)
-        scale_loss = scale_cross_loss + scale_dice_loss
+            loss_pred_shared = softmax_weighted_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
+            loss_pred_shared_ = dice_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
+            loss_pred_shared = loss_pred_shared + loss_pred_shared_
 
-        return loss_pred_final, loss_pred_rgb, loss_pred_ndsm, loss_pred_shared, scale_loss
+            scale_cross_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
+            scale_dice_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
+            for scale_pred in model_output['aux_preds']:
+                scale_pred = scale_pred.to('cuda' if torch.cuda.is_available() else 'mps')
+                y_gt = y_gt.to('cuda' if torch.cuda.is_available() else 'mps')
+                scale_cross_loss += softmax_weighted_loss(scale_pred, y_gt, num_cls=num_cls)
+                scale_dice_loss += dice_loss(scale_pred, y_gt, num_cls=num_cls)
+            scale_loss = scale_cross_loss + scale_dice_loss
+
+            return loss_pred_rgb, loss_pred_ndsm, loss_pred_final, loss_pred_shared, scale_loss
+        else:
+            return loss_pred_rgb, loss_pred_ndsm
     
     def _masked_abs_cos_sim(self, x, y):
         return (self.alignment_cos_sim(x, y).abs()).sum() / (1e-6)
@@ -259,27 +278,32 @@ class DrFuse_RS_Trainer(nn.Module):
 
         return loss_disentanglement
     
-    def _compute_and_log_loss(self, model_output, y_gt, log=False, mode='train', pairs=None):
+    def _compute_and_log_loss(self, model_output, y_gt, pretrain, log=False, mode='train', pairs=None):
         # TODO handle missing modality with pairs, search for where 'pairs' argument is passed in original drfuse
 
-        prediction_losses = self._compute_prediction_losses(model_output, y_gt, log, mode)
+        prediction_losses = self._compute_prediction_losses(model_output, y_gt, pretrain, log, mode)
 
         if log:
-            self.loss_dict[mode]['pred_final'].append(prediction_losses[0].item())
-            self.loss_dict[mode]['pred_rgb'].append(prediction_losses[1].item())
-            self.loss_dict[mode]['pred_ndsm'].append(prediction_losses[2].item())
-            self.loss_dict[mode]['pred_shared'].append(prediction_losses[3].item())
-            self.loss_dict[mode]['scale_loss'].append(prediction_losses[4].item())
+            self.loss_dict[mode]['pred_rgb'].append(prediction_losses[0].item())
+            self.loss_dict[mode]['pred_ndsm'].append(prediction_losses[1].item())
+
+            if not pretrain:
+                self.loss_dict[mode]['pred_final'].append(prediction_losses[2].item())
+                self.loss_dict[mode]['pred_shared'].append(prediction_losses[3].item())
+                self.loss_dict[mode]['scale_loss'].append(prediction_losses[4].item())
         
         loss_prediction = sum(prediction_losses)
 
-        loss_disentanglement = self._disentangle_loss_jsd(model_output, log, mode)
+        if not pretrain:
+            loss_disentanglement = self._disentangle_loss_jsd(model_output, log, mode)
 
-        loss_total = loss_prediction + loss_disentanglement
+            loss_total = loss_prediction + loss_disentanglement
 
-        # TODO aux loss for attention ranking
+            # TODO aux loss for attention ranking
 
-        return loss_total
+            return loss_total
+        else:
+            return loss_prediction
     
 
 class DrFuse_RS_Model(nn.Module):
