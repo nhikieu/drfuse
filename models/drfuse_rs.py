@@ -108,11 +108,11 @@ class DrFuse_RS_Trainer(nn.Module):
                             running_val_loss += val_loss
 
                             if (_+1) == len(val_loader):
-                                val_img, val_seg_full, val_seg_miss = self._log_val_seg(batch, self.pretrain)
+                                viz = self._log_val_seg(batch, self.pretrain)
 
                     val_loss = running_val_loss / len(val_loader)
 
-                    self._wanb_log(train_loss, val_loss, self.example_count, epoch, val_img, val_seg_full, val_seg_miss)
+                    self._wanb_log(train_loss, val_loss, self.example_count, epoch, viz)
 
                     # Save loss_dict to file
                     with open(os.path.join(self.saveModelPath,'loss_dict.json'), 'w') as f:
@@ -156,15 +156,28 @@ class DrFuse_RS_Trainer(nn.Module):
 
         return val_loss.item()
     
-    def _wanb_log(self, train_loss, val_loss, step, epoch, val_img, val_seg_full, val_seg_miss):
-        wandb.log({
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'val_img': val_img,
-            'val_seg_full': val_seg_full,
-            'val_seg_miss': val_seg_miss
-        }, step=step)
+    def _wanb_log(self, train_loss, val_loss, step, epoch, viz):
+        if len(viz) == 3:
+            val_img, val_seg_full, val_seg_miss = viz
+            wandb.log({
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_img': val_img,
+                'val_seg_full': val_seg_full,
+                'val_seg_miss': val_seg_miss
+            }, step=step)
+        else:
+            val_img, val_seg_rgb, val_seg_ndsm, val_seg_shared = viz
+            wandb.log({
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_img': val_img,
+                'val_seg_rgb': val_seg_rgb,
+                'val_seg_ndsm': val_seg_ndsm,
+                'val_seg_shared': val_seg_shared
+            }, step=step)
 
         print(f"Train loss after {str(step).zfill(5)} examples: {train_loss:.3f}")
         print(f"Val loss after {str(step).zfill(5)} examples: {val_loss:.3f}")
@@ -182,8 +195,25 @@ class DrFuse_RS_Trainer(nn.Module):
             with torch.no_grad():
                 mask = torch.tensor([1])
                 output = self.model(img, mask)
-                output_full = output['pred_rgb'][0]
-                output_miss = output['pred_ndsm'][0]
+                output_rgb = output['pred_rgb'][0]
+                output_ndsm = output['pred_ndsm'][0]
+                output_shared = output['pred_shared'][0]
+
+            output_rgb = output_rgb.argmax(dim=0)
+            output_ndsm = output_ndsm.argmax(dim=0)
+            output_shared = output_shared.argmax(dim=0)
+
+            seg_array_rgb = self._convert_prediction(output_rgb.squeeze())
+            seg_array_ndsm = self._convert_prediction(output_ndsm.squeeze())
+            seg_array_shared = self._convert_prediction(output_shared.squeeze())
+        
+            img_array = wandb.Image(img_array, caption="images")
+            seg_array_rgb = wandb.Image(seg_array_rgb, caption="seg_rgb")
+            seg_array_ndsm = wandb.Image(seg_array_ndsm, caption="seg_ndsm")
+            seg_array_shared = wandb.Image(seg_array_shared, caption="seg_shared")
+            
+            self.model.to('cuda')
+            return (img_array, seg_array_rgb, seg_array_ndsm, seg_array_shared)
         else:
             with torch.no_grad():
                 mask = torch.tensor([1])
@@ -191,19 +221,19 @@ class DrFuse_RS_Trainer(nn.Module):
                 mask = torch.tensor([0])
                 output_miss = self.model(img, mask)['pred_multimodal'][0]
 
-        output_full = output_full.argmax(dim=0)
-        output_miss = output_miss.argmax(dim=0)
+            output_full = output_full.argmax(dim=0)
+            output_miss = output_miss.argmax(dim=0)
 
-        seg_array_full = self._convert_prediction(output_full.squeeze())
-        seg_array_miss = self._convert_prediction(output_miss.squeeze())
-    
-        img_array = wandb.Image(img_array, caption="images")
-        seg_array_full = wandb.Image(seg_array_full, caption="seg_full")
-        seg_array_miss = wandb.Image(seg_array_miss, caption="seg_miss")
+            seg_array_full = self._convert_prediction(output_full.squeeze())
+            seg_array_miss = self._convert_prediction(output_miss.squeeze())
+        
+            img_array = wandb.Image(img_array, caption="images")
+            seg_array_full = wandb.Image(seg_array_full, caption="seg_full")
+            seg_array_miss = wandb.Image(seg_array_miss, caption="seg_miss")
 
-        self.model.to('cuda')
+            self.model.to('cuda')
 
-        return img_array, seg_array_full, seg_array_miss
+            return (img_array, seg_array_full, seg_array_miss)
 
 
     def _convert_prediction(self, image):
@@ -227,21 +257,21 @@ class DrFuse_RS_Trainer(nn.Module):
 
         # TODO implement missing modality at training
         loss_pred_rgb = softmax_weighted_loss(model_output['pred_rgb'], y_gt, num_cls=num_cls)
-        loss_pred_rgb_ = dice_loss(model_output['pred_rgb'], y_gt, num_cls=num_cls)
-        loss_pred_rgb = loss_pred_rgb + loss_pred_rgb_
+        # loss_pred_rgb_ = dice_loss(model_output['pred_rgb'], y_gt, num_cls=num_cls)
+        # loss_pred_rgb = loss_pred_rgb + loss_pred_rgb_
 
         loss_pred_ndsm = softmax_weighted_loss(model_output['pred_ndsm'], y_gt, num_cls=num_cls)
-        loss_pred_ndsm_ = dice_loss(model_output['pred_ndsm'], y_gt, num_cls=num_cls)
-        loss_pred_ndsm = loss_pred_ndsm + loss_pred_ndsm_
+        # loss_pred_ndsm_ = dice_loss(model_output['pred_ndsm'], y_gt, num_cls=num_cls)
+        # loss_pred_ndsm = loss_pred_ndsm + loss_pred_ndsm_
+
+        loss_pred_shared = softmax_weighted_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
+            # loss_pred_shared_ = dice_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
+            # loss_pred_shared = loss_pred_shared + loss_pred_shared_
 
         if not pretrain:
             loss_pred_final = softmax_weighted_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
-            loss_pred_final_ = dice_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
-            loss_pred_final = loss_pred_final + loss_pred_final_
-
-            loss_pred_shared = softmax_weighted_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
-            loss_pred_shared_ = dice_loss(model_output['pred_shared'], y_gt, num_cls=num_cls)
-            loss_pred_shared = loss_pred_shared + loss_pred_shared_
+            # loss_pred_final_ = dice_loss(model_output['pred_multimodal'], y_gt, num_cls=num_cls)
+            # loss_pred_final = loss_pred_final + loss_pred_final_
 
             scale_cross_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
             scale_dice_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
@@ -249,12 +279,12 @@ class DrFuse_RS_Trainer(nn.Module):
                 scale_pred = scale_pred.to('cuda' if torch.cuda.is_available() else 'mps')
                 y_gt = y_gt.to('cuda' if torch.cuda.is_available() else 'mps')
                 scale_cross_loss += softmax_weighted_loss(scale_pred, y_gt, num_cls=num_cls)
-                scale_dice_loss += dice_loss(scale_pred, y_gt, num_cls=num_cls)
+                # scale_dice_loss += dice_loss(scale_pred, y_gt, num_cls=num_cls)
             scale_loss = scale_cross_loss + scale_dice_loss
 
-            return loss_pred_rgb, loss_pred_ndsm, loss_pred_final, loss_pred_shared, scale_loss
+            return loss_pred_rgb, loss_pred_ndsm, loss_pred_shared, loss_pred_final, scale_loss
         else:
-            return loss_pred_rgb, loss_pred_ndsm
+            return loss_pred_rgb, loss_pred_ndsm, loss_pred_shared
     
     def _masked_abs_cos_sim(self, x, y):
         return (self.alignment_cos_sim(x, y).abs()).sum() / (1e-6)
@@ -286,24 +316,23 @@ class DrFuse_RS_Trainer(nn.Module):
         if log:
             self.loss_dict[mode]['pred_rgb'].append(prediction_losses[0].item())
             self.loss_dict[mode]['pred_ndsm'].append(prediction_losses[1].item())
-
+            self.loss_dict[mode]['pred_shared'].append(prediction_losses[2].item())
             if not pretrain:
-                self.loss_dict[mode]['pred_final'].append(prediction_losses[2].item())
-                self.loss_dict[mode]['pred_shared'].append(prediction_losses[3].item())
+                self.loss_dict[mode]['pred_final'].append(prediction_losses[3].item())
                 self.loss_dict[mode]['scale_loss'].append(prediction_losses[4].item())
         
         loss_prediction = sum(prediction_losses)
 
-        if not pretrain:
-            loss_disentanglement = self._disentangle_loss_jsd(model_output, log, mode)
+        # if not pretrain:
+        loss_disentanglement = self._disentangle_loss_jsd(model_output, log, mode)
 
-            loss_total = loss_prediction + loss_disentanglement
+        loss_total = loss_prediction + loss_disentanglement
 
             # TODO aux loss for attention ranking
 
-            return loss_total
-        else:
-            return loss_prediction
+        return loss_total
+        # else:
+        #     return loss_prediction
     
 
 class DrFuse_RS_Model(nn.Module):
@@ -367,18 +396,17 @@ class DrFuse_RS_Model(nn.Module):
         rgb_transformer_x5 = self.rgb_transformer(rgb_token_x5, self.rgb_pos)
         ndsm_transformer_x5 = self.ndsm_transformer(ndsm_token_x5, self.ndsm_pos)
 
-        rgb_token_x5 = self.rgb_decode_conv(rgb_transformer_x5.permute(0, 2, 1).contiguous().view(batch_size, TRANSFORMER_BASIC_DIMS, patch_size, patch_size))
-        ndsm_token_x5 = self.ndsm_decode_conv(ndsm_transformer_x5.permute(0, 2, 1).contiguous().view(batch_size, TRANSFORMER_BASIC_DIMS, patch_size, patch_size))
-
-        # Modality-specific heads
-        rgb_pred = self.rgb_decoder_sep(rgb_x1, rgb_x2, rgb_x3, rgb_x4, rgb_token_x5)
-        ndsm_pred = self.ndsm_decoder_sep(ndsm_x1, ndsm_x2, ndsm_x3, ndsm_x4, ndsm_token_x5)
-
         rgb_shared_feat = self.rgb_shared_feat(rgb_transformer_x5)
         rgb_distinct_feat = self.rgb_distinct_feat(rgb_transformer_x5)
 
         ndsm_shared_feat = self.ndsm_shared_feat(ndsm_transformer_x5)
         ndsm_distinct_feat = self.ndsm_distinct_feat(ndsm_transformer_x5)
+
+        # Modality-specific heads
+        rgb_token_x5 = self.rgb_decode_conv(rgb_distinct_feat.permute(0, 2, 1).contiguous().view(batch_size, TRANSFORMER_BASIC_DIMS, patch_size, patch_size))
+        ndsm_token_x5 = self.ndsm_decode_conv(ndsm_distinct_feat.permute(0, 2, 1).contiguous().view(batch_size, TRANSFORMER_BASIC_DIMS, patch_size, patch_size))
+        rgb_pred = self.rgb_decoder_sep(rgb_x1, rgb_x2, rgb_x3, rgb_x4, rgb_token_x5)
+        ndsm_pred = self.ndsm_decoder_sep(ndsm_x1, ndsm_x2, ndsm_x3, ndsm_x4, ndsm_token_x5)
 
         rgb_shared_feat = self.shared_project(rgb_shared_feat)
         ndsm_shared_feat = self.shared_project(ndsm_shared_feat)
