@@ -41,7 +41,7 @@ class DrFuse_RS_Trainer(nn.Module):
         self.alignment_cos_sim = nn.CosineSimilarity(dim=1)
         self.jsd = JSD()
         
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=6e-4, weight_decay=0.01)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=6e-6)
         self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=15, T_mult=2)
 
         if ckpt is not None:
@@ -83,7 +83,10 @@ class DrFuse_RS_Trainer(nn.Module):
 
         for epoch in tqdm(range(150)):
             for _, (images, labels, masks) in enumerate(train_loader):
-                batch = (images.to(device), labels.to(device), torch.tensor(masks).to(device))
+                images = images.to(device)
+                labels = labels.to(device)
+                masks = torch.tensor(masks).to(device)
+                batch = (images, labels, masks)
 
                 if self.example_count % 512 == 0 or (_+1) == len(train_loader):
                     log = True
@@ -103,7 +106,10 @@ class DrFuse_RS_Trainer(nn.Module):
                     running_val_loss = 0
                     with torch.no_grad():
                         for _, (images, labels, masks) in enumerate(val_loader):
-                            batch = (images.to(device), labels.to(device), torch.tensor(masks).to(device))
+                            images = images.to(device)
+                            labels = labels.to(device)
+                            masks = torch.tensor(masks).to(device)
+                            batch = (images, labels, masks)
                             val_loss = self.validation_step(batch, self.pretrain)
                             running_val_loss += val_loss
 
@@ -274,13 +280,14 @@ class DrFuse_RS_Trainer(nn.Module):
             # loss_pred_final = loss_pred_final + loss_pred_final_
 
             scale_cross_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
-            scale_dice_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
+            # scale_dice_loss = torch.zeros(1).float().to('cuda' if torch.cuda.is_available() else 'mps')
             for scale_pred in model_output['aux_preds']:
                 scale_pred = scale_pred.to('cuda' if torch.cuda.is_available() else 'mps')
                 y_gt = y_gt.to('cuda' if torch.cuda.is_available() else 'mps')
                 scale_cross_loss += softmax_weighted_loss(scale_pred, y_gt, num_cls=num_cls)
                 # scale_dice_loss += dice_loss(scale_pred, y_gt, num_cls=num_cls)
-            scale_loss = scale_cross_loss + scale_dice_loss
+            # scale_loss = scale_cross_loss + scale_dice_loss
+            scale_loss = scale_cross_loss
 
             return loss_pred_rgb, loss_pred_ndsm, loss_pred_shared, loss_pred_final, scale_loss
         else:
